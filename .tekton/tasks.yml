@@ -8,7 +8,7 @@ spec:
     - name: source
   params:
     - name: IMAGE
-      description: The built image URL to push
+      description: The target image URL to push
       type: string
     - name: DOCKERFILE
       description: Path to the Dockerfile
@@ -20,39 +20,40 @@ spec:
       default: .
   steps:
     - name: build-and-push
-      image: quay.io/buildah/stable:latest
+      image: quay.io/openshift/origin-cli:latest
       workingDir: $(workspaces.source.path)
-      securityContext:
-        runAsUser: 1000
-      env:
-        - name: STORAGE_DRIVER
-          value: vfs
       script: |
         #!/bin/bash
         set -e
 
-        # Read the service account token automatically mounted in every pod
-        TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        # Extract just the app name from the full image URL
+        # e.g. image-registry.../sn-labs-joseluisotx/ci-cd-final-project:latest
+        # becomes: ci-cd-final-project
+        APP_NAME=$(echo "$(params.IMAGE)" \
+          | awk -F'/' '{print $NF}' \
+          | awk -F':' '{print $1}')
 
-        echo "Logging in to internal registry using service account token..."
-        buildah --storage-driver=vfs login \
-          --tls-verify=false \
-          -u serviceaccount \
-          -p $TOKEN \
-          image-registry.openshift-image-registry.svc:5000
+        echo "App name: ${APP_NAME}"
+        echo "Target image: $(params.IMAGE)"
 
-        echo "Building image $(params.IMAGE) ..."
-        buildah --storage-driver=vfs bud \
-          --format=oci \
-          --tls-verify=false \
-          -f $(params.DOCKERFILE) \
-          -t $(params.IMAGE) \
-          $(params.CONTEXT)
+        # Create BuildConfig if it doesn't already exist
+        if ! oc get bc/${APP_NAME} 2>/dev/null; then
+          echo "Creating BuildConfig ${APP_NAME}..."
+          oc new-build \
+            --binary \
+            --strategy=docker \
+            --name=${APP_NAME} \
+            --to=$(params.IMAGE) \
+            -l app=${APP_NAME}
+        else
+          echo "BuildConfig ${APP_NAME} already exists, skipping create."
+        fi
 
-        echo "Pushing image $(params.IMAGE) ..."
-        buildah --storage-driver=vfs push \
-          --tls-verify=false \
-          $(params.IMAGE) \
-          docker://$(params.IMAGE)
+        # Start the binary build from the workspace source directory
+        echo "Starting build from source..."
+        oc start-build ${APP_NAME} \
+          --from-dir=$(params.CONTEXT) \
+          --follow \
+          --wait
 
         echo "Build and push complete."
