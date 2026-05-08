@@ -1,51 +1,58 @@
-apiVersion: tekton.dev/v1beta1
-kind: Task
-metadata:
-  name: cleanup
-spec:
-  description: This task will clean up a workspace by deleting all the files.
-  workspaces:
-    - name: source
-  steps:
-    - name: remove
-      image: alpine:3
-      env:
-        - name: WORKSPACE_SOURCE_PATH
-          value: $(workspaces.source.path)
-      workingDir: $(workspaces.source.path)
-      securityContext:
-        runAsNonRoot: false
-        runAsUser: 0
-      script: |
-        #!/usr/bin/env sh
-        set -eu
-        echo "Removing all files from ${WORKSPACE_SOURCE_PATH} ..."
-        if [ -d "${WORKSPACE_SOURCE_PATH}" ] ; then
-          rm -rf "${WORKSPACE_SOURCE_PATH:?}"/*
-          rm -rf "${WORKSPACE_SOURCE_PATH}"/.[!.]*
-          rm -rf "${WORKSPACE_SOURCE_PATH}"/..?*
-        fi
-
 ---
 apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
-  name: nose
+  name: buildah
 spec:
   workspaces:
     - name: source
   params:
-    - name: args
-      description: Arguments to pass to nose
+    - name: IMAGE
+      description: The built image URL to push
       type: string
-      default: "-v"
+    - name: DOCKERFILE
+      description: Path to the Dockerfile
+      type: string
+      default: ./Dockerfile
+    - name: CONTEXT
+      description: Build context path
+      type: string
+      default: .
   steps:
-    - name: nosetests
-      image: python:3.9-slim
+    - name: build-and-push
+      image: quay.io/buildah/stable:latest
       workingDir: $(workspaces.source.path)
+      securityContext:
+        runAsUser: 1000
+      env:
+        - name: STORAGE_DRIVER
+          value: vfs
       script: |
         #!/bin/bash
         set -e
-        python -m pip install --upgrade pip wheel
-        pip install -r requirements.txt
-        nosetests $(params.args)
+
+        # Read the service account token automatically mounted in every pod
+        TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+
+        echo "Logging in to internal registry using service account token..."
+        buildah --storage-driver=vfs login \
+          --tls-verify=false \
+          -u serviceaccount \
+          -p $TOKEN \
+          image-registry.openshift-image-registry.svc:5000
+
+        echo "Building image $(params.IMAGE) ..."
+        buildah --storage-driver=vfs bud \
+          --format=oci \
+          --tls-verify=false \
+          -f $(params.DOCKERFILE) \
+          -t $(params.IMAGE) \
+          $(params.CONTEXT)
+
+        echo "Pushing image $(params.IMAGE) ..."
+        buildah --storage-driver=vfs push \
+          --tls-verify=false \
+          $(params.IMAGE) \
+          docker://$(params.IMAGE)
+
+        echo "Build and push complete."
